@@ -1,9 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from time import monotonic
+from unittest import skipUnless
 from unittest.mock import patch
 
-from django.db import connections
-from django.test import TransactionTestCase, skipUnlessDBFeature
+from django.db import connection, connections
+from django.test import TransactionTestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from .api.config import ConfigViewSet
@@ -77,12 +79,13 @@ class ConfigSyncTests(TransactionTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.revision(), before)
 
-    @skipUnlessDBFeature("has_select_for_update")
+    @skipUnless(connection.vendor == "postgresql", "Row-lock observation requires PostgreSQL")
     def test_concurrent_writers_cannot_both_use_same_revision(self):
         before = self.revision()
         entered = Event()
         release = Event()
         second_started = Event()
+        second_pid = []
         writes = []
         original = ConfigViewSet.perform_update
 
@@ -94,9 +97,12 @@ class ConfigSyncTests(TransactionTestCase):
             return original(view, serializer)
 
         def writer(content, started=None):
-            if started is not None:
-                started.set()
             try:
+                if started is not None:
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        second_pid.append(cursor.fetchone()[0])
+                    started.set()
                 return self.request("patch", {"content": content}, revision=before).status_code
             finally:
                 connections.close_all()
@@ -108,6 +114,21 @@ class ConfigSyncTests(TransactionTestCase):
                     self.assertTrue(entered.wait(10))
                     second = pool.submit(writer, "profiles: [second]", second_started)
                     self.assertTrue(second_started.wait(10))
+                    # Observe a database lock wait, not just a stale write
+                    # after the first request has already finished.
+                    blocked = False
+                    deadline = monotonic() + 10
+                    while monotonic() < deadline and not second.done():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                                [second_pid[0]],
+                            )
+                            blocked = cursor.fetchone() == ("Lock",)
+                        if blocked:
+                            break
+                        Event().wait(0.02)
+                    self.assertTrue(blocked, "Second writer did not wait for the row lock")
                 finally:
                     release.set()
                 self.assertEqual(first.result(timeout=10), 200)

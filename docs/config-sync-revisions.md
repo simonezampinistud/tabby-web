@@ -12,7 +12,8 @@ Il controllo di proprietà precede il confronto della revisione.
 
 La garanzia di esclusione tra aggiornamenti richiede un database con supporto
 effettivo a `SELECT FOR UPDATE`, per esempio PostgreSQL. SQLite non fornisce
-la stessa garanzia; il test concorrente viene saltato su quel backend.
+la stessa garanzia. Il test concorrente osserva effettivamente l'attesa del
+secondo scrittore in PostgreSQL; viene saltato sugli altri backend.
 
 Senza l'header rimane disponibile il comportamento dei client esistenti.
 Questi client possono ancora sovrascrivere modifiche successive: il nuovo
